@@ -20,7 +20,7 @@ dataSet
 끝지점을 구한다.
 
 다음과 같이 실행한다.
-python solve.py --dataset <path-to-dataset>
+python solve.py --dataset <absolute-path-to-dataSet>
 
 
 3. Dependencies

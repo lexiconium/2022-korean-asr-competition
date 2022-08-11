@@ -1,8 +1,7 @@
 import argparse
 import json
 import os
-
-import regex
+import re
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -14,9 +13,9 @@ if __name__ == "__main__":
     with open(answer_path, "r") as f:
         answer = json.load(f)
 
-    choice_pattern = regex.compile("\\([^\\(\\)]+\\)/\\([^\\(\\)]+\\)")
-    replace_pattern = regex.compile("[^ 가-힣,.!?]+")
-    whitespace_pattern = regex.compile("\\s+")
+    choice_pattern = re.compile("\\([^\\(\\)]+\\)/\\([^\\(\\)]+\\)")
+    replace_pattern = re.compile("[^ 가-힣,.!?]+")
+    whitespace_pattern = re.compile("\\s+")
 
 
     def choose(s_0: str, s_1: str):
