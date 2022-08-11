@@ -16,6 +16,9 @@ dataSet
     ├── .
     └── 문제3-n.wav
 
+스크립트는 answer.json의 Q3로부터 문제에 사용되는 파일명을 읽은 후 voice_activity_detection 함수를 사용하여 voice activity의 시작지점과
+끝지점을 구한다.
+
 다음과 같이 실행한다.
 python solve.py --dataset <path-to-dataset>
 
