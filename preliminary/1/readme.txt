@@ -3,8 +3,8 @@ solve.py 안의 extract_info 함수는 형식(https://docs.fileformat.com/audio/
 이때 byte rate(Sample Rate * BitsPerSample * Channels) / 8)을 sub chunk의 내용물, 길이와 함께 반환한다.
 
 
-2. 스크립트 실행
-solve.py 스크립트를 실행할 땐 다음 구조를 가정한다.
+2. 스크립트
+solve.py 스크립트는 다음 구조를 가정한다.
 
 dataSet
 ├── answer.json
@@ -25,9 +25,6 @@ THIS sub chunk가 존재할 경우 우선 utf-8 decoding을 시도한 뒤, 불�
 python solve.py --dataset <path-to-dataset>
 
 
-3. Dependencies
+3. Environment
+macOS Monterey 12.5
 python 3.10.4
-
-
-4. Environment
-Q1에 대한 answer는 macOS Monterey 12.5에서 얻었다.
