@@ -22,7 +22,7 @@ THIS sub chunk가 존재할 경우 우선 utf-8 decoding을 시도한 뒤, 불�
 마지막으로 이를 answer.json에 기입한다.
 
 다음과 같이 실행한다.
-python solve.py --dataset <path-to-dataset>
+python solve.py --dataset <absolute-path-to-dataSet>
 
 
 3. Environment

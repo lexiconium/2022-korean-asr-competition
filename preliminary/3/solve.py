@@ -32,7 +32,7 @@ def voice_activity_detection(
     lp_filter_freq: float = 6000.0,
     hp_lifter_freq: float = 150.0,
     lp_lifter_freq: float = 2000.0,
-) -> tuple[torch.Tensor, int]:
+):
     r"""Voice Activity Detector. Similar to SoX implementation.
 
     .. devices:: CPU CUDA

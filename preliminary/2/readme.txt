@@ -11,7 +11,7 @@ dataSet
 마지막으로 불필요한 문장을 제거한 뒤 answer.json에 기입한다.
 
 다음과 같이 실행한다.
-python solve.py --dataset <path-to-dataset>
+python solve.py --dataset <absolute-path-to-dataSet>
 
 
 2. Environment
