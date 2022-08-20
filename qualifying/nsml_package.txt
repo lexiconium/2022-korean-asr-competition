@@ -1,0 +1,2 @@
+gcc
+libsndfile1-dev
