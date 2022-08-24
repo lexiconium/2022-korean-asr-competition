@@ -16,6 +16,7 @@
 import functools
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -28,29 +29,22 @@ import nsml
 import numpy as np
 import torch
 import transformers
+import wandb
 from datasets import DatasetDict, load_dataset
 from torch import optim
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from transformers import (
-    AutoConfig,
-    AutoFeatureExtractor,
-    AutoModelForCTC,
-    AutoTokenizer,
-    HfArgumentParser,
-    Trainer,
-    TrainingArguments,
-    Wav2Vec2ForCTC,
-    Wav2Vec2Processor,
-    get_scheduler,
-    set_seed
-)
-from transformers.trainer_utils import get_last_checkpoint, is_main_process
+from tqdm.auto import tqdm
+from transformers import (AutoConfig, AutoFeatureExtractor, AutoModelForCTC, AutoTokenizer, HfArgumentParser, Trainer,
+                          TrainerCallback, TrainerControl, TrainerState, TrainingArguments, Wav2Vec2ForCTC,
+                          Wav2Vec2Processor, get_scheduler, set_seed)
+from transformers.trainer_utils import is_main_process
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
 from aihub_dataset import PCMAudio
 
-# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
+# will error if the minimal version of Transformers is not installed
 check_min_version("4.21.0")
 
 require_version("datasets>=1.18.0")
@@ -261,12 +255,37 @@ class DataTrainingArguments:
         },
     )
 
+    def __post_init__(self):
+        if self.preprocessing_num_workers is None:
+            self.preprocessing_num_workers = len(os.sched_getaffinity(0))
+
 
 @dataclass
 class NSMLArguments:
     mode: str = field(default="train")
     iteration: str = field(default="0")
     pause: int = field(default=0)
+
+
+class NSMLCallback(TrainerCallback):
+    def on_epoch_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        epoch = math.ceil(state.epoch)
+
+        def save(ckpt_dir: str, **nsml_kwargs):
+            kwargs["model"].save_pretrained(ckpt_dir)
+            nsml_kwargs["processor"].save_pretrained(ckpt_dir)
+            torch.save(kwargs["optimizer"].state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
+            torch.save(kwargs["lr_scheduler"].state_dict(), os.path.join(ckpt_dir, "lr_scheduler.pt"))
+
+            logger.info(f"epoch {epoch} saved in {ckpt_dir}")
+
+        nsml.save(epoch, save_fn=save)
+
+    def on_evaluate(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        nsml.report(
+            summary=True,
+            **kwargs["metrics"]
+        )
 
 
 @dataclass
@@ -370,74 +389,36 @@ def create_vocabulary_from_data(
     return vocab_dict
 
 
-def base_transcript_preprocessing(transcript: str):
-    choice_pattern = re.compile("\\([^\\(\\)]+\\)/\\([^\\(\\)]+\\)")
-    replace_pattern = re.compile("[^ 가-힣,.!?]+")
-    whitespace_pattern = re.compile("\\s+")
-
-    def choose(t0: str, t1: str):
-        if replace_pattern.findall(t0):
-            return t1
-        return t0
-
-    choices = [
-        choose(*map(lambda _s: _s[1:-1], s.split("/")))
-        for s in choice_pattern.findall(transcript)
-    ]
-    pieces = [replace_pattern.sub("", s) for s in choice_pattern.split(transcript)]
-
-    processed = ""
-    for piece, choice in zip(pieces, choices):
-        processed += piece + choice
-    processed += pieces[-1]
-
-    processed = whitespace_pattern.sub(" ", processed.strip()) + " "
-
-    return processed
-
-
-def bind_model(state: dict):
+def bind_model(state: dict, processor):
     """
     save model, tokenizer, optimizer and scheduler.
     when loading, state["processor"] and state["scheduler"] might be None.
     """
 
     def save(path, *args, **kwargs):
-        model: Wav2Vec2ForCTC = state["model"]
-        model.save_pretrained(path)
-
-        processor: Wav2Vec2Processor = state["processor"]
-        processor.save_pretrained(path)
-
-        optimizer: optim.Optimizer = state["optimizer"]
-        torch.save(optimizer.state_dict(), os.path.join(path, "optimizer.pt"))
-
-        scheduler: optim.lr_scheduler.LinearLR = state["scheduler"]
-        torch.save(scheduler.state_dict(), os.path.join(path, "scheduler.pt"))
+        pass
 
     def load(path, *args, **kwargs):
-        state["model"].from_pretrained(path)
-        state["processor"] = Wav2Vec2Processor.from_pretrained(path)
-        state["optimizer"].load_state_dict(torch.load(os.path.join(path, "optimizer.pt")))
+        logger.info(
+            f"only model and processor are called from checkpoint {path}\n"
+            "optimizer and learning rate scheduler are newly initialized for fork process"
+        )
 
-        scheduler = optim.lr_scheduler.LinearLR(state["optimizer"])
-        scheduler.load_state_dict(torch.load(os.path.join(path, "scheduler.pt")))
-        state["scheduler"] = scheduler
+        state["model"] = Wav2Vec2ForCTC.from_pretrained(path)
+        state["processor"] = Wav2Vec2Processor.from_pretrained(path)
 
     def infer(path, *args, **kwargs):
-        model = state["model"]
-        model.eval()
-
-        processor = state["processor"]
-
-        device = next(model.parameters()).device
-
         decoder = PCMAudio(sampling_rate=16_000)._decode_non_mp3_path_like
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        model = state["model"].to(device)
+        processor = state["processor"]
 
         results = []
 
+        model.eval()
         with torch.no_grad():
-            for filepath in glob(os.path.join(path, "*")):
+            for filepath in tqdm(glob(os.path.join(path, "*"))):
                 array, _ = decoder(filepath)
                 array = torch.tensor(array, device=device).unsqueeze(dim=0)
                 logits = model(array).logits
@@ -451,31 +432,27 @@ def bind_model(state: dict):
                         "text": pred_text
                     }
                 )
+
         return sorted(results, key=lambda x: x["filename"])
 
-    nsml.bind(save=save, load=load, infer=infer)
+    nsml.bind(save=save, load=load, infer=infer, processor=processor)
 
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, NSMLArguments))
     model_args, data_args, training_args, nsml_args = parser.parse_args_into_dataclasses()
 
-    # Detect last checkpoint
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None:
-            logger.info(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-            )
+    if nsml_args.mode == "train":
+        # login to WandB
+        os.system("wandb login 149c699bf106247f66f069ce487edd132457d04a")
+        wandb.init(
+            project="ko_asr",
+            entity="lexiconium",
+            name=model_args.model_name_or_path,
+            group="wav2vec2"
+        )
 
-    # Setup logging
+    # setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -483,7 +460,7 @@ def main():
     )
     logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
 
-    # Log on each process
+    # log on each process
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
         f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
@@ -493,17 +470,10 @@ def main():
         transformers.utils.logging.set_verbosity_info()
     logger.info("Training/evaluation parameters %s", training_args)
 
-    # Set seed before initializing model
+    # set seed before initializing model
     set_seed(training_args.seed)
 
-    config = AutoConfig.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        use_auth_token=data_args.use_auth_token
-    )
-
     raw_datasets = DatasetDict()
-
     if nsml_args.mode == "train":
         # load dataset
         if training_args.do_train:
@@ -547,6 +517,31 @@ def main():
             f'[{"".join(data_args.chars_to_ignore)}]' if data_args.chars_to_ignore is not None else None
         )
 
+        choice_pattern = re.compile("\\([^\\(\\)]+\\)/\\([^\\(\\)]+\\)")
+        replace_pattern = re.compile("[^ 가-힣,.!?]+")
+        whitespace_pattern = re.compile("\\s+")
+
+        def base_transcript_preprocessing(transcript: str):
+            def choose(t0: str, t1: str):
+                if replace_pattern.findall(t0):
+                    return t1
+                return t0
+
+            choices = [
+                choose(*map(lambda _s: _s[1:-1], s.split("/")))
+                for s in choice_pattern.findall(transcript)
+            ]
+            pieces = [replace_pattern.sub("", s) for s in choice_pattern.split(transcript)]
+
+            processed = ""
+            for piece, choice in zip(pieces, choices):
+                processed += piece + choice
+            processed += pieces[-1]
+
+            processed = whitespace_pattern.sub(" ", processed.strip()) + " "
+
+            return processed
+
         text_column_name = data_args.text_column_name
 
         def preprocess_transcript(batch):
@@ -565,8 +560,15 @@ def main():
                 desc="remove special characters from datasets",
             )
 
+    config = None
     tokenizer = None
     if nsml_args.mode == "train":
+        config = AutoConfig.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=data_args.use_auth_token
+        )
+
         # create vocabulary and initialize tokenizer
         word_delimiter_token = data_args.word_delimiter_token
         unk_token = data_args.unk_token
@@ -636,13 +638,14 @@ def main():
             }
         )
 
-    feature_extractor = AutoFeatureExtractor.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        use_auth_token=data_args.use_auth_token
-    )
-
+    feature_extractor = None
     if nsml_args.mode == "train":
+        feature_extractor = AutoFeatureExtractor.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_auth_token=data_args.use_auth_token
+        )
+
         # prepare dataset
         dataset_sampling_rate = next(iter(raw_datasets.values())).features[data_args.audio_column_name].sampling_rate
         raw_datasets = raw_datasets.cast_column(
@@ -696,69 +699,34 @@ def main():
             )
 
     processor = None
+    model = None
     if nsml_args.mode == "train":
         processor = Wav2Vec2Processor(feature_extractor, tokenizer)
-
-    model = AutoModelForCTC.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        config=config,
-        use_auth_token=data_args.use_auth_token,
-    )
-
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=training_args.learning_rate,
-        betas=(training_args.adam_beta1, training_args.adam_beta2),
-        eps=training_args.adam_epsilon,
-        weight_decay=training_args.weight_decay
-    )
-
-    scheduler = None
-    if nsml_args.mode == "train":
-        # initialize learning rate scheduler
-        max_steps = training_args.max_steps
-        warmup_steps = training_args.warmup_steps
-
-        if not max_steps > 0:
-            dummy_loader = DataLoader(
-                vectorized_datasets["train"],
-                batch_size=training_args.per_device_train_batch_size
-            )
-            max_steps = len(dummy_loader) * training_args.num_train_epochs
-
-        if warmup_steps == 0 and training_args.warmup_ratio > 0:
-            warmup_steps = int(max_steps * training_args.warmup_ratio)
-
-        scheduler = get_scheduler(
-            training_args.lr_scheduler_type,
-            optimizer,
-            warmup_steps,
-            max_steps
+        model = AutoModelForCTC.from_pretrained(
+            model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            config=config,
+            use_auth_token=data_args.use_auth_token
         )
 
-    state = dict(
-        model=model,
-        processor=processor,
-        optimizer=optimizer,
-        scheduler=scheduler
-    )
-    bind_model(state)
+    state = {}
+    bind_model(state, processor=processor)
 
     if nsml_args.pause:
         nsml.paused(scope=locals())
 
-    model = state["model"]
-    processor = state["processor"]
-    optimizer = state["optimizer"]
-    scheduler = state["scheduler"]
+        if nsml_args.mode == "train":
+            model = state["model"]
+            processor = state["processor"]
 
     if nsml_args.mode == "train":
         if model_args.freeze_feature_encoder:
             model.freeze_feature_encoder()
 
+        # initialize data collator
         data_collator = DataCollatorCTCWithPadding(processor=processor)
 
+        # set metrics
         eval_metrics = {metric: evaluate.load(metric) for metric in data_args.eval_metrics}
 
         def compute_metrics(pred):
@@ -771,10 +739,86 @@ def main():
             # we do not want to group tokens when computing the metrics
             label_str = tokenizer.batch_decode(pred.label_ids, group_tokens=False)
 
-            metrics = {k: v.compute(predictions=pred_str, references=label_str) for k, v in eval_metrics.items()}
+            metrics = {
+                k: v.compute(predictions=pred_str, references=label_str)
+                for k, v in eval_metrics.items()
+            }
 
             return metrics
 
+        # initialize optimizer and learning rate scheduler
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=training_args.learning_rate,
+            betas=(training_args.adam_beta1, training_args.adam_beta2),
+            eps=training_args.adam_epsilon,
+            weight_decay=training_args.weight_decay
+        )
+
+        max_steps = training_args.max_steps
+        warmup_steps = training_args.warmup_steps
+
+        if not max_steps > 0:
+            dummy_loader = DataLoader(
+                vectorized_datasets["train"],
+                batch_size=training_args.per_device_train_batch_size
+            )
+            max_steps = len(dummy_loader) * training_args.num_train_epochs
+            max_steps /= (training_args.gradient_accumulation_steps * training_args.n_gpu)
+
+            del dummy_loader
+
+        if warmup_steps == 0 and training_args.warmup_ratio > 0:
+            warmup_steps = int(max_steps * training_args.warmup_ratio)
+
+        def get_tri_state_schedule(optimizer, num_training_steps, last_epoch=-1):
+            """
+            Create a schedule with a learning rate that is warmed up for the first 10% of updates,
+            held constant for the next 40% and then linearly decayed for the remainder.
+
+            Args:
+                optimizer ([`~torch.optim.Optimizer`]):
+                    The optimizer for which to schedule the learning rate.
+                num_training_steps (`int`):
+                    The total number of training steps.
+                last_epoch (`int`, *optional*, defaults to -1):
+                    The index of the last epoch when resuming training.
+
+            Return:
+                `torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+            """
+
+            logger.info(
+                f"tri-state learning rate scheduler ignores "
+                f"user input warmup steps {training_args.warmup_steps} and ratio {training_args.warmup_steps}"
+            )
+
+            num_warmup_steps = int(num_training_steps * 0.1)
+            num_plateau_steps = int(num_training_steps * 0.4)
+            num_decreasing_steps = num_training_steps - num_warmup_steps - num_plateau_steps
+
+            def lr_lambda(current_step: int):
+                if current_step < num_warmup_steps:
+                    return float(current_step) / float(max(1, num_warmup_steps))
+                if current_step < num_warmup_steps + num_plateau_steps:
+                    return 1
+                return max(
+                    0.0, float(num_training_steps - current_step) / float(max(1, num_decreasing_steps))
+                )
+
+            return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+        if training_args.lr_scheduler_type == "tri":
+            scheduler = get_tri_state_schedule(optimizer, max_steps)
+        else:
+            scheduler = get_scheduler(
+                training_args.lr_scheduler_type,
+                optimizer,
+                warmup_steps,
+                max_steps
+            )
+
+        # initialize trainer
         trainer = Trainer(
             model=model,
             data_collator=data_collator,
@@ -783,19 +827,12 @@ def main():
             train_dataset=vectorized_datasets["train"] if training_args.do_train else None,
             eval_dataset=vectorized_datasets["eval"] if training_args.do_eval else None,
             tokenizer=feature_extractor,
-            optimizers=(optimizer, scheduler)
+            optimizers=(optimizer, scheduler),
+            callbacks=[NSMLCallback]
         )
 
         if training_args.do_train:
-            # use last checkpoint if exist
-            if last_checkpoint is not None:
-                checkpoint = last_checkpoint
-            elif os.path.isdir(model_args.model_name_or_path):
-                checkpoint = model_args.model_name_or_path
-            else:
-                checkpoint = None
-
-            train_result = trainer.train(resume_from_checkpoint=checkpoint)
+            train_result = trainer.train()
 
             metrics = train_result.metrics
             max_train_samples = (
@@ -803,6 +840,10 @@ def main():
                 if data_args.max_train_samples is not None
                 else len(vectorized_datasets["train"])
             )
+            metrics["train_samples"] = min(max_train_samples, len(vectorized_datasets["train"]))
+            trainer.log_metrics("train", metrics)
+
+            torch.cuda.empty_cache()
 
         if training_args.do_eval:
             logger.info("*** Evaluate ***")
@@ -812,8 +853,8 @@ def main():
                 if data_args.max_eval_samples is not None else
                 len(vectorized_datasets["eval"])
             )
-
-        nsml.save(int(training_args.num_train_epochs))
+            metrics["eval_samples"] = min(max_eval_samples, len(vectorized_datasets["eval"]))
+            trainer.log_metrics("eval", metrics)
 
 
 if __name__ == "__main__":
