@@ -131,10 +131,6 @@ class ModelArguments:
 class DataTrainingArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
-
-    Using `HfArgumentParser` we can turn this class
-    into argparse arguments to be able to specify them on
-    the command line.
     """
 
     dataset_name: str = field(
@@ -258,6 +254,19 @@ class DataTrainingArguments:
     def __post_init__(self):
         if self.preprocessing_num_workers is None:
             self.preprocessing_num_workers = len(os.sched_getaffinity(0))
+
+
+@dataclass
+class Wav2Vec2TrainingArguments(TrainingArguments):
+    use_tri_lr_scheduler: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether or not to use tri-state learning rate scheduler."
+                " Applied over lr_scheduler_type if true."
+            )
+        }
+    )
 
 
 @dataclass
@@ -390,11 +399,6 @@ def create_vocabulary_from_data(
 
 
 def bind_model(state: dict, processor):
-    """
-    save model, tokenizer, optimizer and scheduler.
-    when loading, state["processor"] and state["scheduler"] might be None.
-    """
-
     def save(path, *args, **kwargs):
         pass
 
@@ -439,7 +443,7 @@ def bind_model(state: dict, processor):
 
 
 def main():
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, NSMLArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Wav2Vec2TrainingArguments, NSMLArguments))
     model_args, data_args, training_args, nsml_args = parser.parse_args_into_dataclasses()
 
     if nsml_args.mode == "train":
@@ -634,7 +638,7 @@ def main():
                 "ctc_loss_reduction": model_args.ctc_loss_reduction,
                 "pad_token_id": tokenizer.pad_token_id,
                 "vocab_size": len(tokenizer),
-                "activation_dropout": model_args.activation_dropout,
+                "activation_dropout": model_args.activation_dropout
             }
         )
 
@@ -808,7 +812,7 @@ def main():
 
             return LambdaLR(optimizer, lr_lambda, last_epoch)
 
-        if training_args.lr_scheduler_type == "tri":
+        if training_args.use_tri_lr_scheduler:
             scheduler = get_tri_state_schedule(optimizer, max_steps)
         else:
             scheduler = get_scheduler(
