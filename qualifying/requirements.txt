@@ -1,7 +1,7 @@
 # nsml: pytorch/pytorch:1.12.1-cuda11.3-cudnn8-runtime
-transformers
-datasets
-evaluate
+transformers==4.21.1
+datasets==2.4.0
+evaluate==0.2.2
 jiwer
 librosa
 matplotlib
@@ -11,3 +11,4 @@ pandas
 scikit-learn
 SoundFile
 tqdm
+wandb
