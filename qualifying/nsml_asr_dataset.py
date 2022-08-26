@@ -42,7 +42,7 @@ class AIHubDataset(datasets.GeneratorBasedBuilder):
     def _split_generators(self, dl_manager: datasets.DownloadManager):
         metadata = pd.read_csv(_METADATA_PATH)
         train_metadata, validation_metadata = train_test_split(
-            metadata, test_size=0.2, random_state=42, shuffle=True
+            metadata, test_size=0.05, random_state=42, shuffle=True
         )
 
         return [
