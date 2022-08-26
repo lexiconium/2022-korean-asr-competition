@@ -1,3 +1,5 @@
+# Copyright 2022 Minsoo Kim <min-soo.kim@outlook.kr>
+#
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -10,6 +12,8 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
+#
+# This file has been modified by Minsoo Kim <min-soo.kim@outlook.kr>.
 
 """ Fine-tuning a 🤗 Transformers CTC model for automatic speech recognition"""
 
@@ -42,7 +46,7 @@ from transformers.trainer_utils import is_main_process
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
-from aihub_dataset import PCMAudio
+from nsml_asr_dataset import PCMAudio
 from decoder_utils import build_n_gram_decoder
 
 # will error if the minimal version of Transformers is not installed
