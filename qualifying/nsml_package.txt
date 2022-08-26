@@ -1,2 +1,14 @@
-gcc
+#registry koreanai dckr_pat_7OmsQkoAnQyz7ZkQb-ZSk0LeNlI registry.hub.docker.com
+
+build-essential
+cmake
+wget
 libsndfile1-dev
+libboost-system-dev
+libboost-thread-dev
+libboost-program-options-dev
+libboost-test-dev
+libeigen3-dev
+zlib1g-dev
+libbz2-dev
+liblzma-dev

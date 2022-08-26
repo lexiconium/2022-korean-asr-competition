@@ -37,12 +37,13 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (AutoConfig, AutoFeatureExtractor, AutoModelForCTC, AutoTokenizer, HfArgumentParser, Trainer,
                           TrainerCallback, TrainerControl, TrainerState, TrainingArguments, Wav2Vec2ForCTC,
-                          Wav2Vec2Processor, get_scheduler, set_seed)
+                          Wav2Vec2Processor, Wav2Vec2ProcessorWithLM, get_scheduler, set_seed)
 from transformers.trainer_utils import is_main_process
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
 from aihub_dataset import PCMAudio
+from decoder_utils import build_n_gram_decoder
 
 # will error if the minimal version of Transformers is not installed
 check_min_version("4.21.0")
@@ -124,6 +125,11 @@ class ModelArguments:
     layerdrop: float = field(default=0.0, metadata={"help": "The LayerDrop probability."})
     ctc_loss_reduction: Optional[str] = field(
         default="mean", metadata={"help": "The way the ctc loss should be reduced. Should be one of 'mean' or 'sum'."}
+    )
+    use_lm: bool = field(default=False, metadata={"help": "Whether or not to use a language model decoder."})
+    n_gram: int = field(
+        default=4,
+        metadata={"help": "Number of grams for n-gram language model decoder. Valid only if use_lm is true."}
     )
 
 
@@ -228,11 +234,11 @@ class DataTrainingArguments:
         },
     )
     unk_token: str = field(
-        default="[UNK]",
+        default="<unk>",
         metadata={"help": "The unk token for the tokenizer"},
     )
     pad_token: str = field(
-        default="[PAD]",
+        default="<pad>",
         metadata={"help": "The padding token for the tokenizer"},
     )
     word_delimiter_token: str = field(
@@ -258,6 +264,12 @@ class DataTrainingArguments:
 
 @dataclass
 class Wav2Vec2TrainingArguments(TrainingArguments):
+    retain_pretraining_configs: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether or not to retain pretraining configuration e.g. dropouts."
+        }
+    )
     use_tri_lr_scheduler: bool = field(
         default=False,
         metadata={
@@ -322,7 +334,7 @@ class DataCollatorCTCWithPadding:
             This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
             7.5 (Volta).
     """
-    processor: Wav2Vec2Processor
+    processor: Union[Wav2Vec2Processor, Wav2Vec2ProcessorWithLM]
     padding: Union[bool, str] = "longest"
     pad_to_multiple_of: Optional[int] = None
     pad_to_multiple_of_labels: Optional[int] = None
@@ -362,7 +374,7 @@ def create_vocabulary_from_data(
     unk_token: Optional[str] = None,
     pad_token: Optional[str] = None,
 ):
-    # Given training and test labels create vocabulary
+    # create vocabulary given training and test labels
     def extract_all_chars(batch):
         all_text = " ".join(batch["text"])
         vocab = list(set(all_text))
@@ -378,7 +390,8 @@ def create_vocabulary_from_data(
 
     # take union of all unique characters in each dataset
     vocab_set = functools.reduce(
-        lambda vocab_1, vocab_2: set(vocab_1["vocab"][0]) | set(vocab_2["vocab"][0]), vocabs.values()
+        lambda vocab_1, vocab_2: set(vocab_1["vocab"][0]) | set(vocab_2["vocab"][0]),
+        vocabs.values()
     )
 
     vocab_dict = {v: k for k, v in enumerate(sorted(list(vocab_set)))}
@@ -409,7 +422,10 @@ def bind_model(state: dict, processor):
         )
 
         state["model"] = Wav2Vec2ForCTC.from_pretrained(path)
-        state["processor"] = Wav2Vec2Processor.from_pretrained(path)
+        try:
+            state["processor"] = Wav2Vec2ProcessorWithLM.from_pretrained(path)
+        except:
+            state["processor"] = Wav2Vec2Processor.from_pretrained(path)
 
     def infer(path, *args, **kwargs):
         decoder = PCMAudio(sampling_rate=16_000)._decode_non_mp3_path_like
@@ -522,7 +538,7 @@ def main():
         )
 
         choice_pattern = re.compile("\\([^\\(\\)]+\\)/\\([^\\(\\)]+\\)")
-        replace_pattern = re.compile("[^ 가-힣,.!?]+")
+        replace_pattern = re.compile("[^ 가-힣]+")
         whitespace_pattern = re.compile("\\s+")
 
         def base_transcript_preprocessing(transcript: str):
@@ -566,7 +582,8 @@ def main():
 
     config = None
     tokenizer = None
-    if nsml_args.mode == "train":
+    decoder = None
+    if nsml_args.mode == "train" and not nsml_args.pause:
         config = AutoConfig.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
@@ -623,8 +640,13 @@ def main():
         )
 
         # update config
-        config.update(
-            {
+        config.update({
+            "gradient_checkpointing": training_args.gradient_checkpointing,
+            "pad_token_id": tokenizer.pad_token_id,
+            "vocab_size": len(tokenizer)
+        })
+        if not training_args.retain_pretraining_configs:
+            config.update({
                 "feat_proj_dropout": model_args.feat_proj_dropout,
                 "attention_dropout": model_args.attention_dropout,
                 "hidden_dropout": model_args.hidden_dropout,
@@ -633,14 +655,16 @@ def main():
                 "mask_time_length": model_args.mask_time_length,
                 "mask_feature_prob": model_args.mask_feature_prob,
                 "mask_feature_length": model_args.mask_feature_length,
-                "gradient_checkpointing": training_args.gradient_checkpointing,
                 "layerdrop": model_args.layerdrop,
                 "ctc_loss_reduction": model_args.ctc_loss_reduction,
-                "pad_token_id": tokenizer.pad_token_id,
-                "vocab_size": len(tokenizer),
                 "activation_dropout": model_args.activation_dropout
-            }
-        )
+            })
+
+        if model_args.use_lm:
+            # build n-gram language model
+            decoder = build_n_gram_decoder(
+                raw_datasets["train"]["text"], tokenizer=tokenizer, n_gram=model_args.n_gram
+            )
 
     feature_extractor = None
     if nsml_args.mode == "train":
@@ -704,8 +728,12 @@ def main():
 
     processor = None
     model = None
-    if nsml_args.mode == "train":
-        processor = Wav2Vec2Processor(feature_extractor, tokenizer)
+    if nsml_args.mode == "train" and not nsml_args.pause:
+        if model_args.use_lm:
+            processor = Wav2Vec2ProcessorWithLM(feature_extractor, tokenizer, decoder)
+        else:
+            processor = Wav2Vec2Processor(feature_extractor, tokenizer)
+
         model = AutoModelForCTC.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
@@ -778,7 +806,8 @@ def main():
         def get_tri_state_schedule(optimizer, num_training_steps, last_epoch=-1):
             """
             Create a schedule with a learning rate that is warmed up for the first 10% of updates,
-            held constant for the next 40% and then linearly decayed for the remainder.
+            held constant for the next 40% and then linearly decayed for the remainder. [wav2vec 2.0: A Framework for
+            Self-Supervised Learning of Speech Representations](https://arxiv.org/pdf/2006.11477.pdf)
 
             Args:
                 optimizer ([`~torch.optim.Optimizer`]):

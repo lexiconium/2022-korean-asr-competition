@@ -1,4 +1,5 @@
 # nsml: pytorch/pytorch:1.12.1-cuda11.3-cudnn8-runtime
+
 transformers==4.21.1
 datasets==2.4.0
 evaluate==0.2.2
@@ -12,3 +13,5 @@ scikit-learn
 SoundFile
 tqdm
 wandb
+pyctcdecode
+https://github.com/kpu/kenlm/archive/master.zip
