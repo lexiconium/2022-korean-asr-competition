@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-_DESCRIPTION = "ai-hub dataset for automatic speech recognition"
+_DESCRIPTION = "Automatic speech recognition dataset for NSML(NAVER Smart Machine Learning)"
 
 _DATA_DIR = os.path.join(nsml.DATASET_PATH, "train", "train_data")
 _METADATA_PATH = os.path.join(nsml.DATASET_PATH, "train", "train_label")
