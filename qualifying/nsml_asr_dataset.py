@@ -27,7 +27,7 @@ class PCMAudio(datasets.Audio):
         return array, self.sampling_rate
 
 
-class AIHubDataset(datasets.GeneratorBasedBuilder):
+class NSMLAutomaticSpeechRecognitionDataset(datasets.GeneratorBasedBuilder):
     def _info(self):
         return datasets.DatasetInfo(
             description=_DESCRIPTION,
