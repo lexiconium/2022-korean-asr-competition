@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 class TextProcessor(ABC):
     """
-    A metaclass used for type checking a text processor.
+    A metaclass used for type checking.
     """
 
     @abstractmethod
@@ -16,7 +16,7 @@ class TextProcessor(ABC):
 @dataclass
 class DuplicatedWhitespaceRemovingTextProcessor(TextProcessor):
     """
-    Removes duplicated whitespace in any given string.
+    Removes duplicated whitespaces in any given string.
     """
     whitespace_pattern: re.Pattern = field(init=False)
 
@@ -75,7 +75,11 @@ class AnonymityMaskTextProcessor(TextProcessor):
         pass
 
 
-class Sequential:
+class SequentialTextProcessor(TextProcessor):
+    """
+    Sequentially executes passed text processors when it's called.
+    All passed text processors must be a class inherited from TextProcessor.
+    """
     def __init__(self, *args: TextProcessor):
         for processor in args:
             if not isinstance(processor, TextProcessor):

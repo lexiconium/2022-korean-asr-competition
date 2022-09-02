@@ -46,10 +46,14 @@ from transformers.trainer_utils import is_main_process
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
+from decoder.n_gram_decoder import build_n_gram_decoder
 from nsml_asr_dataset import PCMAudio
-from decoder_utils import build_n_gram_decoder
+from processors.modeling_text_processors import (ChoiceSelectionTextProcessor,
+                                                 DuplicatedWhitespaceRemovingTextProcessor,
+                                                 SequentialTextProcessor)
+from utils.config import read_yaml_config
 
-# will error if the minimal version of Transformers is not installed
+# Will error if the minimal version of Transformers is not installed
 check_min_version("4.21.0")
 
 require_version("datasets>=1.18.0")
@@ -267,7 +271,10 @@ class DataTrainingArguments:
 
 
 @dataclass
-class Wav2Vec2TrainingArguments(TrainingArguments):
+class CTCTrainingArguments(TrainingArguments):
+    wandb_authentication_path: str = field(
+        default="authentication/wandb.yaml", metadata={"help": "Path to WandB authentication file."}
+    )
     retain_pretraining_configs: bool = field(
         default=False,
         metadata={
@@ -417,18 +424,20 @@ def create_vocabulary_from_data(
 
 def bind_model(state: dict, processor):
     def save(path, *args, **kwargs):
-        pass
+        """
+        NSML save function is defined and called inside NSMLCallback
+        """
 
     def load(path, *args, **kwargs):
         logger.info(
-            f"only model and processor are called from checkpoint {path}\n"
-            "optimizer and learning rate scheduler are newly initialized for fork process"
+            f"Only model and processor are called from the checkpoint {path}."
+            " Optimizer and learning rate scheduler are newly initialized for fork process"
         )
 
         state["model"] = Wav2Vec2ForCTC.from_pretrained(path)
         try:
             state["processor"] = Wav2Vec2ProcessorWithLM.from_pretrained(path)
-        except:
+        except UserWarning("Wav2Vec2ProcessorWithLM object not found. Loading object from Wav2Vec2Processor."):
             state["processor"] = Wav2Vec2Processor.from_pretrained(path)
 
     def infer(path, *args, **kwargs):
@@ -463,20 +472,21 @@ def bind_model(state: dict, processor):
 
 
 def main():
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Wav2Vec2TrainingArguments, NSMLArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, CTCTrainingArguments, NSMLArguments))
     model_args, data_args, training_args, nsml_args = parser.parse_args_into_dataclasses()
 
     if nsml_args.mode == "train":
-        # login to WandB
-        os.system("wandb login 149c699bf106247f66f069ce487edd132457d04a")
+        # Configure Weight and Biases logger
+        wandb_authentication = read_yaml_config(training_args.wandb_authentication_path)
+        os.system(f"wandb login {wandb_authentication['hash']}")
         wandb.init(
             project="ko_asr",
-            entity="lexiconium",
+            entity=wandb_authentication["username"],
             name=model_args.model_name_or_path,
-            group="wav2vec2"
+            group="ctc"
         )
 
-    # setup logging
+    # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -484,7 +494,7 @@ def main():
     )
     logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
 
-    # log on each process
+    # Log on each process
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
         f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
@@ -494,12 +504,12 @@ def main():
         transformers.utils.logging.set_verbosity_info()
     logger.info("Training/evaluation parameters %s", training_args)
 
-    # set seed before initializing model
+    # Set seed before initializing model
     set_seed(training_args.seed)
 
     raw_datasets = DatasetDict()
     if nsml_args.mode == "train":
-        # load dataset
+        # Load dataset
         if training_args.do_train:
             raw_datasets["train"] = load_dataset(
                 data_args.dataset_name,
@@ -536,35 +546,15 @@ def main():
             if data_args.max_eval_samples is not None:
                 raw_datasets["eval"] = raw_datasets["eval"].select(range(data_args.max_eval_samples))
 
-        # preprocess transcripts
+        # Preprocess transcripts
         chars_to_ignore_regex = (
             f'[{"".join(data_args.chars_to_ignore)}]' if data_args.chars_to_ignore is not None else None
         )
 
-        choice_pattern = re.compile("\\([^\\(\\)]+\\)/\\([^\\(\\)]+\\)")
-        replace_pattern = re.compile("[^ 가-힣]+")
-        whitespace_pattern = re.compile("\\s+")
-
-        def base_transcript_preprocessing(transcript: str):
-            def choose(t0: str, t1: str):
-                if replace_pattern.findall(t0):
-                    return t1
-                return t0
-
-            choices = [
-                choose(*map(lambda _s: _s[1:-1], s.split("/")))
-                for s in choice_pattern.findall(transcript)
-            ]
-            pieces = [replace_pattern.sub("", s) for s in choice_pattern.split(transcript)]
-
-            processed = ""
-            for piece, choice in zip(pieces, choices):
-                processed += piece + choice
-            processed += pieces[-1]
-
-            processed = whitespace_pattern.sub(" ", processed.strip()) + " "
-
-            return processed
+        text_preprocessor = SequentialTextProcessor(
+            ChoiceSelectionTextProcessor(condition="[^ 가-힣]+"),
+            DuplicatedWhitespaceRemovingTextProcessor()
+        )
 
         text_column_name = data_args.text_column_name
 
@@ -573,7 +563,7 @@ def main():
                 batch[text_column_name] = re.sub(chars_to_ignore_regex, "", batch[text_column_name])
 
             batch["text"] = batch[text_column_name].lower()
-            batch["text"] = base_transcript_preprocessing(batch["text"])
+            batch["text"] = text_preprocessor(batch["text"])
 
             return batch
 
@@ -665,10 +655,11 @@ def main():
             })
 
         if model_args.use_lm:
-            # build n-gram language model
-            decoder = build_n_gram_decoder(
-                raw_datasets["train"]["text"], tokenizer=tokenizer, n_gram=model_args.n_gram
-            )
+            with training_args.main_process_first(desc="building n-gram decoder"):
+                # build n-gram language model
+                decoder = build_n_gram_decoder(
+                    raw_datasets["train"]["text"], tokenizer=tokenizer, n_gram=model_args.n_gram
+                )
 
     feature_extractor = None
     if nsml_args.mode == "train":
