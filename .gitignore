@@ -13,4 +13,4 @@ develop
 nsml
 env.sh
 
-authentication/*.yaml
+qualifying/authentication/*.yaml
