@@ -1,9 +1,16 @@
 __pycache__
+
 .DS_Store
 .idea
+
 *.ipynb
+
+2022-Korean-AI-Competition
+
 submitted
 develop
+
 nsml
 env.sh
-authentication/wandb.yaml
+
+authentication/*.yaml
