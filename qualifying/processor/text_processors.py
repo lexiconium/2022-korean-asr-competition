@@ -1,6 +1,7 @@
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import List, Optional
 
 
 class TextProcessor(ABC):
@@ -39,7 +40,7 @@ class ChoiceSelectionTextProcessor(TextProcessor):
     ex) 'Choose (one)/(#two) between choices.' -> 'Choose one between choices.' if condition: '[^ a-z]+'.
     """
     condition: str = field(
-        metadata={"help": "A regex format condition. The choice which violates this condition is dropped."}
+        metadata={"help": "A condition in regex format. The choice which violates this condition is dropped."}
     )
 
     choice_pattern: re.Pattern = field(init=False)
@@ -70,9 +71,36 @@ class ChoiceSelectionTextProcessor(TextProcessor):
 
 
 @dataclass
-class AnonymityMaskTextProcessor(TextProcessor):
+class SubstituteExceptTextProcessor(TextProcessor):
+    condition: str = field(
+        metadata={
+            "help": "A condition in regex format. When text processor is called,"
+                    " it substitutes letters according to this condition."
+        }
+    )
+    substitute_to: str = field(default="", metadata={"help": "String to substitute if the condition is valid."})
+    exceptions: Optional[List[str]] = field(default=None, metadata={"help": "Identifies exceptions."})
+
+    exception_pattern: re.Pattern = field(init=False)
+    substitution_pattern: re.Pattern = field(init=False)
+
+    def __post_init__(self):
+        self.exception_pattern = re.compile("|".join(self.exceptions))
+        self.substitution_pattern = re.compile(self.condition)
+
     def __call__(self, text: str):
-        pass
+        exceptions = self.exception_pattern.findall(text)
+        blanked_sentences = [
+            self.substitution_pattern.sub(self.substitute_to, s)
+            for s in self.exception_pattern.split(text)
+        ]
+
+        processed = ""
+        for blanked_sentence, exception in zip(blanked_sentences, exceptions):
+            processed += blanked_sentence + exception
+        processed += blanked_sentences[-1]
+
+        return processed
 
 
 class SequentialTextProcessor(TextProcessor):
@@ -80,6 +108,7 @@ class SequentialTextProcessor(TextProcessor):
     Sequentially executes passed text processors when it's called.
     All passed text processors must be a class inherited from TextProcessor.
     """
+
     def __init__(self, *args: TextProcessor):
         for processor in args:
             if not isinstance(processor, TextProcessor):

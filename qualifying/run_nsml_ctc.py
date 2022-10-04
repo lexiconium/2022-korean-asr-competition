@@ -40,18 +40,18 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (AutoConfig, AutoFeatureExtractor, AutoModelForCTC, AutoTokenizer, HfArgumentParser, Trainer,
-                          TrainerCallback, TrainerControl, TrainerState, TrainingArguments, Wav2Vec2ForCTC,
-                          Wav2Vec2Processor, Wav2Vec2ProcessorWithLM, get_scheduler, set_seed)
+                          TrainerCallback, TrainerControl, TrainerState, TrainingArguments, Wav2Vec2Processor,
+                          Wav2Vec2ProcessorWithLM, get_scheduler, set_seed)
 from transformers.trainer_utils import is_main_process
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
+from configs.config_utils import read_yaml_config
 from decoder.n_gram_decoder import build_n_gram_decoder
 from nsml_asr_dataset import PCMAudio
-from processors.modeling_text_processors import (ChoiceSelectionTextProcessor,
-                                                 DuplicatedWhitespaceRemovingTextProcessor,
-                                                 SequentialTextProcessor)
-from utils.config import read_yaml_config
+from processor.text_processors import (ChoiceSelectionTextProcessor,
+                                       DuplicatedWhitespaceRemovingTextProcessor,
+                                       SequentialTextProcessor, SubstituteExceptTextProcessor)
 
 # Will error if the minimal version of Transformers is not installed
 check_min_version("4.21.0")
@@ -133,6 +133,14 @@ class ModelArguments:
     layerdrop: float = field(default=0.0, metadata={"help": "The LayerDrop probability."})
     ctc_loss_reduction: Optional[str] = field(
         default="mean", metadata={"help": "The way the ctc loss should be reduced. Should be one of 'mean' or 'sum'."}
+    )
+    ctc_zero_infinity: bool = field(
+        default=False, metadata={
+            "help": (
+                "Whether to zero infinite losses and the associated gradients of `torch.nn.CTCLoss`."
+                " Infinite losses mainly occur when the inputs are too short to be aligned to the targets."
+            )
+        }
     )
     use_lm: bool = field(default=False, metadata={"help": "Whether or not to use a language model decoder."})
     n_gram: int = field(
@@ -325,9 +333,10 @@ class DataCollatorCTCWithPadding:
     """
     Data collator that will dynamically pad the inputs received.
     Args:
-        processor (:class:`~transformers.Wav2Vec2Processor`)
+        processor (:class:`~transformers.Wav2Vec2Processor`, :class:`~transformers.Wav2Vec2ProcessorWithLM`)
             The processor used for proccessing the data.
-        padding (:obj:`bool`, :obj:`str` or :class:`~transformers.tokenization_utils_base.PaddingStrategy`, `optional`, defaults to :obj:`True`):
+        padding (:obj:`bool`, :obj:`str` or :class:`~transformers.tokenization_utils_base.PaddingStrategy`, `optional`,
+                defaults to :obj:`True`):
             Select a strategy to pad the returned sequences (according to the model's padding side and padding index)
             among:
             * :obj:`True` or :obj:`'longest'`: Pad to the longest sequence in the batch (or no padding if only a single
@@ -384,12 +393,26 @@ def create_vocabulary_from_data(
     word_delimiter_token: Optional[str] = None,
     unk_token: Optional[str] = None,
     pad_token: Optional[str] = None,
+    **words_to_tokenize
 ):
-    # create vocabulary given training and test labels
+    exclusive_pattern = None
+    if words_to_tokenize:
+        if any(not isinstance(word, str) for word in words_to_tokenize.values()):
+            raise ValueError(f"All words passed should be a str type. Found {words_to_tokenize.values()}")
+
+        exclusive_pattern = re.compile("|".join(words_to_tokenize))
+
+    # Create vocabulary given training and test labels
     def extract_all_chars(batch):
-        all_text = " ".join(batch["text"])
-        vocab = list(set(all_text))
-        return {"vocab": [vocab], "all_text": [all_text]}
+        texts = batch["text"]
+
+        # Exclude words to tokenize.
+        if exclusive_pattern is not None:
+            texts = [exclusive_pattern.sub("", text) for text in texts]
+
+        texts = " ".join(texts)
+        vocab = list(set(texts))
+        return {"vocab": [vocab], "all_text": [texts]}
 
     vocabs = datasets.map(
         extract_all_chars,
@@ -399,7 +422,7 @@ def create_vocabulary_from_data(
         remove_columns=datasets["train"].column_names
     )
 
-    # take union of all unique characters in each dataset
+    # Take union of all unique characters in each dataset
     vocab_set = functools.reduce(
         lambda vocab_1, vocab_2: set(vocab_1["vocab"][0]) | set(vocab_2["vocab"][0]),
         vocabs.values()
@@ -407,17 +430,22 @@ def create_vocabulary_from_data(
 
     vocab_dict = {v: k for k, v in enumerate(sorted(list(vocab_set)))}
 
-    # replace white space with delimiter token
+    # Replace whitespace with delimiter token
     if word_delimiter_token is not None:
         vocab_dict[word_delimiter_token] = vocab_dict[" "]
         del vocab_dict[" "]
 
-    # add unk and pad token
+    # Add unk and pad token
     if unk_token is not None:
         vocab_dict[unk_token] = len(vocab_dict)
 
     if pad_token is not None:
         vocab_dict[pad_token] = len(vocab_dict)
+
+    # Add additional words to tokenize
+    if words_to_tokenize:
+        for word in words_to_tokenize.values():
+            vocab_dict[word] = len(vocab_dict)
 
     return vocab_dict
 
@@ -434,10 +462,10 @@ def bind_model(state: dict, processor):
             " Optimizer and learning rate scheduler are newly initialized for fork process"
         )
 
-        state["model"] = Wav2Vec2ForCTC.from_pretrained(path)
+        state["model"] = AutoModelForCTC.from_pretrained(path)
         try:
             state["processor"] = Wav2Vec2ProcessorWithLM.from_pretrained(path)
-        except UserWarning("Wav2Vec2ProcessorWithLM object not found. Loading object from Wav2Vec2Processor."):
+        except:
             state["processor"] = Wav2Vec2Processor.from_pretrained(path)
 
     def infer(path, *args, **kwargs):
@@ -451,24 +479,38 @@ def bind_model(state: dict, processor):
 
         model.eval()
         with torch.no_grad():
-            for filepath in tqdm(glob(os.path.join(path, "*"))):
+            for filepath in tqdm(glob(os.path.join(path, "*")), desc="Inference"):
                 array, _ = decoder(filepath)
                 array = torch.tensor(array, device=device).unsqueeze(dim=0)
                 logits = model(array).logits
 
-                pred_ids = torch.argmax(logits, dim=-1)
-                pred_text = processor.batch_decode(pred_ids)[0]
+                if isinstance(processor, Wav2Vec2Processor):
+                    inputs = torch.argmax(logits, dim=-1)
+                    pred_text = processor.batch_decode(inputs)[0]
+                else:
+                    inputs = logits.squeeze(dim=0)
+                    inputs = inputs.cpu().numpy()
+                    pred_text = processor.decode(inputs)[0]
 
-                results.append(
-                    {
-                        "filename": filepath.split("/")[-1],
-                        "text": pred_text
-                    }
-                )
+                results.append({
+                    "filename": filepath.split("/")[-1],
+                    "text": pred_text
+                })
 
         return sorted(results, key=lambda x: x["filename"])
 
     nsml.bind(save=save, load=load, infer=infer, processor=processor)
+
+
+ANONYMITY_MASKS = [
+    "&name&",
+    "&company-name&",
+    "&social-security-num&",
+    "&card-num&",
+    "&address&",
+    "&tel-num&",
+    "&party-name&"
+]
 
 
 def main():
@@ -552,7 +594,10 @@ def main():
         )
 
         text_preprocessor = SequentialTextProcessor(
-            ChoiceSelectionTextProcessor(condition="[^ 가-힣]+"),
+            ChoiceSelectionTextProcessor(condition="[^ @가-힣]+"),
+            SubstituteExceptTextProcessor(
+                condition="[^ 가-힣]+", substitute_to="", exceptions=ANONYMITY_MASKS
+            ),
             DuplicatedWhitespaceRemovingTextProcessor()
         )
 
@@ -577,7 +622,7 @@ def main():
     config = None
     tokenizer = None
     decoder = None
-    if nsml_args.mode == "train" and not nsml_args.pause:
+    if nsml_args.mode == "train":
         config = AutoConfig.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
@@ -613,6 +658,7 @@ def main():
                         word_delimiter_token=word_delimiter_token,
                         unk_token=unk_token,
                         pad_token=pad_token,
+                        **{mask: mask for mask in ANONYMITY_MASKS}
                     )
 
                     # save vocab dict to be loaded into tokenizer
@@ -624,7 +670,7 @@ def main():
                 "tokenizer_type": config.model_type if config.tokenizer_class is None else None,
                 "unk_token": unk_token,
                 "pad_token": pad_token,
-                "word_delimiter_token": word_delimiter_token,
+                "word_delimiter_token": word_delimiter_token
             }
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -651,7 +697,8 @@ def main():
                 "mask_feature_length": model_args.mask_feature_length,
                 "layerdrop": model_args.layerdrop,
                 "ctc_loss_reduction": model_args.ctc_loss_reduction,
-                "activation_dropout": model_args.activation_dropout
+                "activation_dropout": model_args.activation_dropout,
+                "ctc_zero_infinity": model_args.ctc_zero_infinity
             })
 
         if model_args.use_lm:
@@ -662,6 +709,8 @@ def main():
                 )
 
     feature_extractor = None
+    processor = None
+    model = None
     if nsml_args.mode == "train":
         feature_extractor = AutoFeatureExtractor.from_pretrained(
             model_args.model_name_or_path,
@@ -669,6 +718,29 @@ def main():
             use_auth_token=data_args.use_auth_token
         )
 
+        if model_args.use_lm:
+            processor = Wav2Vec2ProcessorWithLM(feature_extractor, tokenizer, decoder)
+        else:
+            processor = Wav2Vec2Processor(feature_extractor, tokenizer)
+
+        if not nsml_args.pause:
+            model = AutoModelForCTC.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=model_args.cache_dir,
+                config=config,
+                use_auth_token=data_args.use_auth_token
+            )
+
+    state = {}
+    bind_model(state, processor=processor)
+
+    if nsml_args.pause:
+        nsml.paused(scope=locals())
+
+        if nsml_args.mode == "train":
+            model = state["model"]
+
+    if nsml_args.mode == "train":
         # prepare dataset
         dataset_sampling_rate = next(iter(raw_datasets.values())).features[data_args.audio_column_name].sampling_rate
         raw_datasets = raw_datasets.cast_column(
@@ -720,31 +792,6 @@ def main():
                 num_proc=num_workers,
                 input_columns=["input_length"]
             )
-
-    processor = None
-    model = None
-    if nsml_args.mode == "train" and not nsml_args.pause:
-        if model_args.use_lm:
-            processor = Wav2Vec2ProcessorWithLM(feature_extractor, tokenizer, decoder)
-        else:
-            processor = Wav2Vec2Processor(feature_extractor, tokenizer)
-
-        model = AutoModelForCTC.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            config=config,
-            use_auth_token=data_args.use_auth_token
-        )
-
-    state = {}
-    bind_model(state, processor=processor)
-
-    if nsml_args.pause:
-        nsml.paused(scope=locals())
-
-        if nsml_args.mode == "train":
-            model = state["model"]
-            processor = state["processor"]
 
     if nsml_args.mode == "train":
         if model_args.freeze_feature_encoder:
@@ -821,7 +868,7 @@ def main():
                 f"user input warmup steps {training_args.warmup_steps} and ratio {training_args.warmup_steps}"
             )
 
-            num_warmup_steps = int(num_training_steps * 0.1)
+            num_warmup_steps = int(num_training_steps * 0.3)  # 0.1 -> 0.3 for high lr
             num_plateau_steps = int(num_training_steps * 0.4)
             num_decreasing_steps = num_training_steps - num_warmup_steps - num_plateau_steps
 
